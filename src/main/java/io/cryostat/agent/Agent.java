@@ -80,7 +80,7 @@ public class Agent implements Callable<Integer>, Consumer<AgentArgs> {
                         + " to that, failing if none or more than one are found. Otherwise, this"
                         + " should be a process ID, or the '*' wildcard to request the Agent"
                         + " attempt to attach to all discovered JVMs.")
-    private String pid;
+    String pid;
 
     @Option(
             names = {"-D", "--property"},
@@ -90,12 +90,12 @@ public class Agent implements Callable<Integer>, Consumer<AgentArgs> {
                         + " JVM. These should be specified as key=value pairs, ex."
                         + " -Dcryostat.agent.baseuri=http://cryostat.service.local . May be"
                         + " specified more than once.")
-    private Map<String, String> properties;
+    Map<String, String> properties;
 
     @Option(
             names = "--smartTrigger",
             description = "Smart Triggers definition. May be specified more than once.")
-    private List<String> smartTriggers;
+    List<String> smartTriggers;
 
     // standalone entry point, Agent is started separately and should self-inject and dynamic attach
     // to the host JVM application. After the agent is dynamically attached we should begin
@@ -107,7 +107,7 @@ public class Agent implements Callable<Integer>, Consumer<AgentArgs> {
 
     @Override
     public Integer call() throws Exception {
-        new Attacher().attach(properties, smartTriggers, pid);
+        new Attacher().attach(this);
         return 0;
     }
 

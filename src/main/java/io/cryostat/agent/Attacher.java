@@ -19,8 +19,8 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
@@ -34,16 +34,17 @@ class Attacher {
     static final String ALL_PIDS = "*";
     static final String AUTO_ATTACH_PID = "0";
 
-    void attach(Map<String, String> properties, List<String> smartTriggers, String pidSpec)
-            throws Exception {
-        List<String> pids = getAttachPid(pidSpec);
+    void attach(Agent agent) throws Exception {
+        List<String> pids = getAttachPid(agent.pid);
         if (pids.isEmpty()) {
             throw new IllegalStateException("No candidate JVM PIDs");
         }
         String agentmainArg =
                 new AgentArgs(
-                                properties,
-                                String.join(",", smartTriggers != null ? smartTriggers : List.of()))
+                                agent.properties,
+                                String.join(
+                                        ",",
+                                        Optional.ofNullable(agent.smartTriggers).orElse(List.of())))
                         .toAgentMain();
         for (String pid : pids) {
             VirtualMachine vm = VirtualMachine.attach(pid);
