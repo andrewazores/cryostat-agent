@@ -19,8 +19,6 @@ import java.io.IOException;
 import java.lang.instrument.Instrumentation;
 import java.lang.management.ManagementFactory;
 import java.net.URI;
-import java.net.URISyntaxException;
-import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -32,8 +30,6 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
-import java.util.function.Predicate;
-import java.util.stream.Collectors;
 
 import javax.inject.Named;
 import javax.inject.Singleton;
@@ -46,15 +42,9 @@ import io.cryostat.agent.harvest.Harvester;
 import io.cryostat.agent.insights.InsightsAgentHelper;
 import io.cryostat.agent.model.PluginInfo;
 import io.cryostat.agent.mxbean.CryostatAgentMXBeanImpl;
-import io.cryostat.agent.shaded.ShadeLogger;
 import io.cryostat.agent.triggers.TriggerEvaluator;
 import io.cryostat.libcryostat.net.CryostatAgentMXBean;
 
-import com.sun.tools.attach.AgentInitializationException;
-import com.sun.tools.attach.AgentLoadException;
-import com.sun.tools.attach.AttachNotSupportedException;
-import com.sun.tools.attach.VirtualMachine;
-import com.sun.tools.attach.VirtualMachineDescriptor;
 import dagger.Component;
 import io.smallrye.config.SmallRyeConfig;
 import org.apache.commons.lang3.tuple.Pair;
@@ -79,8 +69,6 @@ import sun.misc.SignalHandler;
 public class Agent implements Callable<Integer>, Consumer<AgentArgs> {
 
     private static final AtomicBoolean needsCleanup = new AtomicBoolean(true);
-    private static final String ALL_PIDS = "*";
-    static final String AUTO_ATTACH_PID = "0";
 
     @Parameters(
             index = "0",
@@ -118,31 +106,8 @@ public class Agent implements Callable<Integer>, Consumer<AgentArgs> {
     }
 
     @Override
-    public Integer call()
-            throws IOException,
-                    AttachNotSupportedException,
-                    AgentInitializationException,
-                    AgentLoadException,
-                    URISyntaxException {
-        List<String> pids = getAttachPid(pid);
-        if (pids.isEmpty()) {
-            throw new IllegalStateException("No candidate JVM PIDs");
-        }
-        String agentmainArg =
-                new AgentArgs(
-                                properties,
-                                String.join(",", smartTriggers != null ? smartTriggers : List.of()))
-                        .toAgentMain();
-        for (String pid : pids) {
-            VirtualMachine vm = VirtualMachine.attach(pid);
-            ShadeLogger.getAnonymousLogger()
-                    .fine(String.format("Injecting agent into PID %s", pid));
-            try {
-                vm.loadAgent(Path.of(selfJarLocation()).toAbsolutePath().toString(), agentmainArg);
-            } finally {
-                vm.detach();
-            }
-        }
+    public Integer call() throws Exception {
+        new Attacher().attach(properties, smartTriggers, pid);
         return 0;
     }
 
@@ -168,47 +133,6 @@ public class Agent implements Callable<Integer>, Consumer<AgentArgs> {
         t.setDaemon(true);
         t.setName("cryostat-agent-main");
         t.start();
-    }
-
-    private static List<String> getAttachPid(String pidSpec) {
-        List<VirtualMachineDescriptor> vms = VirtualMachine.list();
-        Predicate<VirtualMachineDescriptor> vmFilter;
-        if (ALL_PIDS.equals(pidSpec)) {
-            vmFilter = vmd -> true;
-        } else if (pidSpec == null || AUTO_ATTACH_PID.equals(pidSpec)) {
-            if (vms.size() > 2) { // one of them is ourself
-                throw new IllegalStateException(
-                        String.format(
-                                "Too many available virtual machines. Auto-attach only progresses"
-                                        + " if there is one candidate. VMs: %s",
-                                vms));
-            } else if (vms.size() < 2) {
-                throw new IllegalStateException(
-                        String.format(
-                                "Too few available virtual machines. Auto-attach only progresses if"
-                                        + " there is one candidate. VMs: %s",
-                                vms));
-            }
-            long ownId = ProcessHandle.current().pid();
-            vmFilter = vmd -> !Objects.equals(String.valueOf(ownId), vmd.id());
-        } else {
-            vmFilter = vmd -> pidSpec.equals(vmd.id());
-        }
-        return vms.stream()
-                .filter(vmFilter)
-                .peek(
-                        vmd ->
-                                ShadeLogger.getAnonymousLogger()
-                                        .fine(
-                                                String.format(
-                                                        "Attaching to VM: %s %s",
-                                                        vmd.displayName(), vmd.id())))
-                .map(VirtualMachineDescriptor::id)
-                .collect(Collectors.toList());
-    }
-
-    static URI selfJarLocation() throws URISyntaxException {
-        return Agent.class.getProtectionDomain().getCodeSource().getLocation().toURI();
     }
 
     @Override
