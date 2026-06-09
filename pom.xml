@@ -92,6 +92,7 @@
   <info.picocli.version>4.7.7</info.picocli.version>
   <com.redhat.insights.agent.version>1.0.3</com.redhat.insights.agent.version>
   <net.bytebuddy.version>1.14.19</net.bytebuddy.version>
+  <com.kohlschutter.junixsocket.version>2.10.1</com.kohlschutter.junixsocket.version>
 
   <com.github.spotbugs.version>4.10.1</com.github.spotbugs.version>
   <com.github.spotbugs.plugin.version>4.9.8.4</com.github.spotbugs.plugin.version>
@@ -239,6 +240,11 @@
     <groupId>net.bytebuddy</groupId>
     <artifactId>byte-buddy-agent</artifactId>
     <version>${net.bytebuddy.version}</version>
+  </dependency>
+  <dependency>
+    <groupId>com.kohlschutter.junixsocket</groupId>
+    <artifactId>junixsocket-native-common</artifactId>
+    <version>${com.kohlschutter.junixsocket.version}</version>
   </dependency>
 
   <!-- test deps -->
@@ -395,6 +401,10 @@
               <relocation>
                 <pattern>net.bytebuddy</pattern>
                 <shadedPattern>${shade.prefix}.net.bytebuddy</shadedPattern>
+              </relocation>
+              <relocation>
+                <pattern>org.newsclub.net.unix</pattern>
+                <shadedPattern>${shade.prefix}.org.newsclub.net.unix</shadedPattern>
               </relocation>
             </relocations>
             <transformers>
