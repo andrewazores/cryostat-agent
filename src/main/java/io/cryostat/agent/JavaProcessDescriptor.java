@@ -21,11 +21,11 @@ import java.util.Objects;
  * Represents information about a Java process, providing a replacement for VirtualMachineDescriptor
  * that works without the Attach API.
  */
-class JavaProcessInfo {
+class JavaProcessDescriptor {
     private final String pid;
     private final String displayName;
 
-    JavaProcessInfo(String pid, String displayName) {
+    JavaProcessDescriptor(String pid, String displayName) {
         this.pid = Objects.requireNonNull(pid, "pid must not be null");
         this.displayName = Objects.requireNonNull(displayName, "displayName must not be null");
     }
@@ -51,8 +51,8 @@ class JavaProcessInfo {
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;
-        if (!(o instanceof JavaProcessInfo)) return false;
-        JavaProcessInfo that = (JavaProcessInfo) o;
+        if (!(o instanceof JavaProcessDescriptor)) return false;
+        JavaProcessDescriptor that = (JavaProcessDescriptor) o;
         return pid.equals(that.pid);
     }
 

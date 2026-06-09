@@ -33,7 +33,7 @@ class ProcessDiscovery {
      *
      * @return a list of JavaProcessInfo objects representing Java processes
      */
-    static List<JavaProcessInfo> listJavaProcesses() {
+    static List<JavaProcessDescriptor> listJavaProcesses() {
         try {
             return ProcessHandle.allProcesses()
                     .filter(ProcessDiscovery::isJavaProcess)
@@ -56,13 +56,7 @@ class ProcessDiscovery {
      * @return true if the process is a Java process, false otherwise
      */
     private static boolean isJavaProcess(ProcessHandle ph) {
-        Optional<String> cmd = ph.info().command();
-        if (!cmd.isPresent()) {
-            return false;
-        }
-
-        String command = cmd.get().toLowerCase();
-        return command.contains("java") || command.endsWith("java") || command.endsWith("java.exe");
+        return ph.info().command().map(c -> c.toLowerCase().contains("java")).orElse(false);
     }
 
     /**
@@ -71,10 +65,8 @@ class ProcessDiscovery {
      * @param ph the ProcessHandle to convert
      * @return a JavaProcessInfo object
      */
-    private static JavaProcessInfo toJavaProcessInfo(ProcessHandle ph) {
-        String pid = String.valueOf(ph.pid());
-        String displayName = extractDisplayName(ph);
-        return new JavaProcessInfo(pid, displayName);
+    private static JavaProcessDescriptor toJavaProcessInfo(ProcessHandle ph) {
+        return new JavaProcessDescriptor(String.valueOf(ph.pid()), extractDisplayName(ph));
     }
 
     /**
