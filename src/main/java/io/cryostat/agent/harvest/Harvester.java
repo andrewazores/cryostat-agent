@@ -28,10 +28,12 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.UnaryOperator;
 
@@ -44,6 +46,7 @@ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import jdk.jfr.FlightRecorder;
 import jdk.jfr.FlightRecorderListener;
 import jdk.jfr.Recording;
+import jdk.jfr.RecordingState;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -63,6 +66,7 @@ public class Harvester implements FlightRecorderListener {
     private final String template;
     private final int maxFiles;
     private final RecordingSettings exitSettings;
+    private final long exitTimeout;
     private final RecordingSettings periodicSettings;
     private final boolean autoanalyze;
     private final CryostatClient client;
@@ -71,6 +75,16 @@ public class Harvester implements FlightRecorderListener {
     private Optional<TemplatedRecording> sownRecording = Optional.empty();
     private final Map<TemplatedRecording, Path> exitPaths = new ConcurrentHashMap<>();
     private final AtomicBoolean exitUploadInitiated = new AtomicBoolean(false);
+    // Set synchronously as soon as an exit upload is requested, before any asynchronous work is
+    // submitted. Once set, the JVM is on its way down and the Harvester must not destroy any
+    // recording or dump file that the exit upload may still need: the JDK's own
+    // "JFR Shutdown Hook" runs concurrently with ours and will stop the sown recording out from
+    // under us, and that stop is what writes the tail-end data to its destination file.
+    private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
+    // Counted down once the sown recording's dump-on-exit destination file has been written and is
+    // safe to read, whether that write was performed by our own exit upload or by the JDK's JFR
+    // shutdown hook.
+    private volatile CountDownLatch exitDumpWritten = new CountDownLatch(1);
     private final AtomicBoolean scheduledUploadInProgress = new AtomicBoolean(false);
     private FlightRecorder flightRecorder;
     private Future<?> task;
@@ -84,6 +98,7 @@ public class Harvester implements FlightRecorderListener {
             String template,
             int maxFiles,
             RecordingSettings exitSettings,
+            long exitTimeout,
             RecordingSettings periodicSettings,
             boolean autoanalyze,
             CryostatClient client,
@@ -95,6 +110,7 @@ public class Harvester implements FlightRecorderListener {
         this.template = template;
         this.maxFiles = maxFiles;
         this.exitSettings = exitSettings;
+        this.exitTimeout = exitTimeout;
         this.periodicSettings = periodicSettings;
         this.autoanalyze = autoanalyze;
         this.client = client;
@@ -232,29 +248,70 @@ public class Harvester implements FlightRecorderListener {
                                 case RUNNING:
                                     break;
                                 case STOPPED:
+                                    if (isSownRecording) {
+                                        // PlatformRecording#stop flips the state to STOPPED
+                                        // *before* writing the destination file, and only notifies
+                                        // listeners once that write has completed. Observing the
+                                        // STOPPED state is therefore not proof that the dump file
+                                        // is readable, but arriving here is. This is the signal the
+                                        // exit upload fallback waits on.
+                                        exitDumpWritten.countDown();
+                                    }
                                     try {
-                                        if (!exitUploadInitiated.get()) {
+                                        if (!exitUploadInitiated.get()
+                                                && !(isSownRecording && shuttingDown.get())) {
                                             tr.getRecording().dump(exitPaths.get(tr));
-                                            uploadRecording(tr).get();
+                                            // This callback can be invoked on the JDK's
+                                            // "JFR Shutdown Hook" thread, which the JVM must join
+                                            // before it can exit, so it must never block
+                                            // indefinitely.
+                                            if (exitTimeout > 0) {
+                                                uploadRecording(tr)
+                                                        .get(exitTimeout, TimeUnit.MILLISECONDS);
+                                            } else {
+                                                uploadRecording(tr).get();
+                                            }
                                         }
                                     } catch (IOException e) {
                                         log.error("Failed to dump recording to file", e);
-                                    } catch (InterruptedException | ExecutionException e) {
+                                    } catch (InterruptedException
+                                            | ExecutionException
+                                            | TimeoutException e) {
                                         log.warn("Could not upload exit dump file", e);
                                     }
-                                    if (isSownRecording) {
+                                    if (isSownRecording && !shuttingDown.get()) {
+                                        // During shutdown the in-flight exit upload owns the
+                                        // lifecycle of this recording and closes it in its own
+                                        // finally block. Closing it here would drop the recording's
+                                        // chunks (PlatformRecording#close does not write the
+                                        // destination) while the exit upload is still reading them.
                                         safeCloseCurrentRecording();
                                     }
                                     // next
                                     break;
                                 case CLOSED:
+                                    if (shuttingDown.get()) {
+                                        // Keep the tracking entry and the dump file. The stop that
+                                        // preceded this close wrote the tail-end data to
+                                        // exitPaths.get(tr), and that file is the exit upload's
+                                        // fallback source. It is a temp file in the container's
+                                        // ephemeral storage, so leaving it behind on the way out
+                                        // costs nothing.
+                                        log.trace(
+                                                "Shutting down, retaining temp file {} for exit"
+                                                        + " upload",
+                                                exitPaths.get(tr));
+                                        break;
+                                    }
                                     executor.submit(
                                             () -> {
                                                 try {
                                                     recordings.remove(tr);
                                                     Path exitPath = exitPaths.remove(tr);
-                                                    Files.deleteIfExists(exitPath);
-                                                    log.trace("Deleted temp file {}", exitPath);
+                                                    if (exitPath != null) {
+                                                        Files.deleteIfExists(exitPath);
+                                                        log.trace("Deleted temp file {}", exitPath);
+                                                    }
                                                 } catch (IOException e) {
                                                     log.warn("Could not delete temp file", e);
                                                 } finally {
@@ -273,26 +330,192 @@ public class Harvester implements FlightRecorderListener {
     }
 
     public Future<Void> exitUpload() {
-        return CompletableFuture.supplyAsync(
-                () -> {
-                    running = false;
-                    if (flightRecorder == null) {
-                        return null;
-                    }
-                    try {
-                        if (!exitUploadInitiated.getAndSet(true)) {
-                            uploadOngoing(PushType.ON_EXIT, exitSettings).get();
-                        }
-                    } catch (ExecutionException | InterruptedException e) {
-                        log.error("Exit upload failed", e);
-                        throw new CompletionException(e);
-                    } finally {
-                        safeCloseCurrentRecording();
-                    }
-                    log.trace("Harvester stopped");
-                    return null;
-                },
-                executor);
+        // Must be set on the calling (shutdown hook) thread rather than inside the async task:
+        // otherwise the JDK's JFR shutdown hook can stop and close the sown recording during the
+        // window between submission and execution, and our own listener callback would tear down
+        // the data this upload is about to read.
+        shuttingDown.set(true);
+        // The deadline is taken here, on the shutdown hook thread, rather than inside the task.
+        // The task is submitted to a single-threaded executor that may still be busy with a
+        // periodic upload, and that queueing delay has to count against the budget too - otherwise
+        // the caller can block for the queue wait *plus* the full budget.
+        final long deadline = deadlineFrom(exitTimeout);
+        CompletableFuture<Void> f =
+                CompletableFuture.supplyAsync(
+                        () -> {
+                            running = false;
+                            if (flightRecorder == null) {
+                                return null;
+                            }
+                            try {
+                                if (!exitUploadInitiated.getAndSet(true)) {
+                                    doExitUpload(deadline);
+                                }
+                            } finally {
+                                safeCloseCurrentRecording();
+                            }
+                            log.trace("Harvester stopped");
+                            return null;
+                        },
+                        executor);
+        if (exitTimeout > 0) {
+            // Hard backstop. The task runs on a daemon thread, so abandoning it cannot keep the
+            // JVM alive; what matters is that the shutdown hook waiting on this future is released
+            // and orderly shutdown continues.
+            f = f.orTimeout(exitTimeout, TimeUnit.MILLISECONDS);
+        }
+        return f;
+    }
+
+    private void doExitUpload(long deadline) {
+        try {
+            long remaining = remainingMillis(deadline);
+            if (remaining <= 0) {
+                throw new TimeoutException(
+                        "Exit upload budget of " + exitTimeout + "ms elapsed before starting");
+            }
+            uploadOngoing(PushType.ON_EXIT, exitSettings).get(remaining, TimeUnit.MILLISECONDS);
+        } catch (ExecutionException
+                | InterruptedException
+                | TimeoutException
+                | RuntimeException e) {
+            // The snapshot path is the only one that can honour exit-max-age-ms/exit-max-size-b,
+            // so it is always tried first. It is also the most fragile: it has to create a
+            // snapshot, open a new file and copy chunks out, all while the JDK's JFR shutdown hook
+            // may already be tearing the recorder down and while the heap may be exhausted. Fall
+            // back to the dump-on-exit file, which the recording writes to its pre-assigned
+            // destination as a side effect of being stopped by whoever gets there first.
+            log.warn(
+                    "Exit snapshot upload failed, falling back to the recording's dump-on-exit"
+                            + " file",
+                    e);
+            // Deliberately not restoring the interrupt flag before the fallback runs: throwing
+            // InterruptedException already cleared it, and re-setting it here would make the
+            // fallback's await() throw immediately. It is restored once the fallback has had its
+            // turn.
+            boolean fellBack = exitUploadFallback(deadline);
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            if (!fellBack) {
+                log.error("Exit upload failed", e);
+                throw new CompletionException(e);
+            }
+        }
+    }
+
+    /**
+     * @param budgetMillis the total budget, or a non-positive value for no budget
+     * @return a {@link System#nanoTime()}-based deadline, or {@link Long#MAX_VALUE} if unbounded
+     */
+    private static long deadlineFrom(long budgetMillis) {
+        if (budgetMillis <= 0) {
+            return Long.MAX_VALUE;
+        }
+        return System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(budgetMillis);
+    }
+
+    private static long remainingMillis(long deadline) {
+        if (deadline == Long.MAX_VALUE) {
+            return Long.MAX_VALUE;
+        }
+        return TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+    }
+
+    /**
+     * Last-resort attempt to push the tail-end of the sown recording after the exit snapshot upload
+     * has failed.
+     *
+     * <p>Every recording the Harvester tracks is given a destination file up front (see {@link
+     * #handleNewRecording(TemplatedRecording, RecordingSettings)}), and the JDK writes that file
+     * synchronously as part of stopping the recording. That makes the file available on two
+     * independent paths: we can stop the recording ourselves, or the JDK's own JFR shutdown hook -
+     * which runs concurrently with the Agent's and calls {@code PlatformRecorder#destroy} - will
+     * have stopped it for us. Either way the bytes are already on disk and only need uploading.
+     *
+     * @return true if tail-end data was successfully uploaded
+     */
+    private boolean exitUploadFallback(long deadline) {
+        Optional<TemplatedRecording> opt = sownRecording;
+        if (opt.isEmpty()) {
+            log.warn("No sown recording available for exit upload fallback");
+            return false;
+        }
+        TemplatedRecording tr = opt.get();
+        Path exitPath = exitPaths.get(tr);
+        if (exitPath == null) {
+            log.warn("Sown recording has no dump-on-exit file to fall back to");
+            return false;
+        }
+        try {
+            if (!awaitExitDump(tr, deadline)) {
+                log.warn(
+                        "Timed out waiting for the dump-on-exit file to be written; releasing the"
+                                + " shutdown hook");
+                return false;
+            }
+            if (!Files.exists(exitPath) || Files.size(exitPath) < 1) {
+                log.warn("Dump-on-exit file {} holds no recording data", exitPath);
+                return false;
+            }
+            log.debug(
+                    "Uploading dump-on-exit file {} ({} bytes on disk)",
+                    exitPath,
+                    Files.size(exitPath));
+            long remaining = remainingMillis(deadline);
+            if (remaining <= 0) {
+                log.warn(
+                        "Exit upload budget of {}ms elapsed before the dump-on-exit file could be"
+                                + " sent; releasing the shutdown hook",
+                        exitTimeout);
+                return false;
+            }
+            client.upload(
+                            PushType.ON_EXIT,
+                            Optional.of(tr),
+                            maxFiles,
+                            additionalLabels(tr.getRecording(), false),
+                            exitPath)
+                    .get(remaining, TimeUnit.MILLISECONDS);
+            log.debug("Exit upload fallback succeeded");
+            return true;
+        } catch (TimeoutException e) {
+            log.warn("Exit upload fallback exceeded the remaining shutdown budget", e);
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("Interrupted during exit upload fallback", e);
+            return false;
+        } catch (IOException | ExecutionException | RuntimeException e) {
+            log.error("Exit upload fallback failed", e);
+            return false;
+        }
+    }
+
+    /**
+     * Blocks until the sown recording's destination file has been written, stopping the recording
+     * ourselves if nobody else has yet.
+     *
+     * <p>The recording's state is not a usable signal here: {@code PlatformRecording#stop} sets
+     * STOPPED inside the recorder lock and only writes the destination afterwards, notifying
+     * listeners once the write has completed. So a recording can read as STOPPED while its dump
+     * file is still empty or partial. {@link #exitDumpWritten} is counted down from the listener
+     * callback, which is the first point at which the file is known to be complete.
+     */
+    private boolean awaitExitDump(TemplatedRecording tr, long deadline)
+            throws InterruptedException {
+        if (RecordingState.RUNNING.equals(tr.getRecording().getState())) {
+            try {
+                // Writes the destination file before returning, so no waiting is required.
+                tr.getRecording().stop();
+                return true;
+            } catch (IllegalStateException e) {
+                // Lost the race to the JDK's JFR shutdown hook, which is already performing the
+                // stop (and therefore the write) on our behalf. Wait for it below.
+                log.trace("Sown recording was stopped concurrently", e);
+            }
+        }
+        return exitDumpWritten.await(remainingMillis(deadline), TimeUnit.MILLISECONDS);
     }
 
     public void handleNewNamedRecording(TemplatedRecording tr, String filename) {
@@ -338,6 +561,7 @@ public class Harvester implements FlightRecorderListener {
                             .ifPresent(
                                     recording -> {
                                         handleNewRecording(recording, this.periodicSettings);
+                                        this.exitDumpWritten = new CountDownLatch(1);
                                         this.sownRecording = Optional.of(recording);
                                         recording.getRecording().start();
                                         log.debug(
