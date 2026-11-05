@@ -16,11 +16,23 @@
 package io.cryostat.agent.harvest;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 import io.cryostat.agent.CryostatClient;
 import io.cryostat.agent.FlightRecorderHelper;
@@ -31,6 +43,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -167,5 +180,131 @@ class HarvesterTest {
         assertEquals("0", labels.get("startTime"));
         assertEquals("0", labels.get("duration"));
         assertEquals(String.valueOf(recording.getId()), labels.get("sourceRecordingId"));
+    }
+
+    @Test
+    void testScheduledUploadSkippedWhilePreviousUploadInProgress() throws Exception {
+        Harvester periodicHarvester =
+                new Harvester(
+                        executor,
+                        workerPool,
+                        60_000L,
+                        "default",
+                        5,
+                        new Harvester.RecordingSettings(),
+                        new Harvester.RecordingSettings(),
+                        false,
+                        client,
+                        flightRecorderHelper,
+                        registration);
+        when(executor.submit(any(Runnable.class)))
+                .thenAnswer(
+                        inv -> {
+                            inv.<Runnable>getArgument(0).run();
+                            return null;
+                        });
+        CompletableFuture<Void> inFlight = new CompletableFuture<>();
+        when(client.upload(any(), any(), anyInt(), any(), any())).thenReturn(inFlight);
+
+        recording = new Recording();
+        recording.start();
+
+        try {
+            periodicHarvester.start();
+            ArgumentCaptor<Runnable> scheduled = ArgumentCaptor.forClass(Runnable.class);
+            verify(workerPool)
+                    .scheduleAtFixedRate(
+                            scheduled.capture(),
+                            eq(60_000L),
+                            eq(60_000L),
+                            eq(TimeUnit.MILLISECONDS));
+
+            scheduled.getValue().run();
+            verify(client, times(1)).upload(any(), any(), anyInt(), any(), any());
+
+            scheduled.getValue().run();
+            verify(client, times(1)).upload(any(), any(), anyInt(), any(), any());
+
+            inFlight.complete(null);
+
+            scheduled.getValue().run();
+            verify(client, times(2)).upload(any(), any(), anyInt(), any(), any());
+        } finally {
+            periodicHarvester.stop();
+        }
+    }
+
+    @Test
+    void testDumpDeletedAfterSuccessfulScheduledUpload() throws Exception {
+        when(client.upload(any(), any(), anyInt(), any(), any()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+
+        Path dump = runScheduledUploadAndCaptureDump();
+
+        assertFalse(Files.exists(dump), "dump should be deleted after a successful upload");
+    }
+
+    @Test
+    void testDumpDeletedAfterFailedScheduledUpload() throws Exception {
+        when(client.upload(any(), any(), anyInt(), any(), any()))
+                .thenReturn(CompletableFuture.failedFuture(new IOException("upload failed")));
+
+        Path dump = runScheduledUploadAndCaptureDump();
+
+        assertFalse(Files.exists(dump), "dump should be deleted after a failed upload");
+    }
+
+    @Test
+    void testDumpDeletedWhenUploadFailsSynchronously() throws Exception {
+        when(client.upload(any(), any(), anyInt(), any(), any()))
+                .thenThrow(new IOException("could not start upload"));
+
+        Path dump = runScheduledUploadAndCaptureDump();
+
+        assertFalse(Files.exists(dump), "dump should be deleted when the upload cannot start");
+    }
+
+    private Path runScheduledUploadAndCaptureDump() throws Exception {
+        Harvester periodicHarvester =
+                new Harvester(
+                        executor,
+                        workerPool,
+                        60_000L,
+                        "default",
+                        5,
+                        new Harvester.RecordingSettings(),
+                        new Harvester.RecordingSettings(),
+                        false,
+                        client,
+                        flightRecorderHelper,
+                        registration);
+        when(executor.submit(any(Runnable.class)))
+                .thenAnswer(
+                        inv -> {
+                            inv.<Runnable>getArgument(0).run();
+                            return null;
+                        });
+
+        recording = new Recording();
+        recording.start();
+
+        try {
+            periodicHarvester.start();
+            ArgumentCaptor<Runnable> scheduled = ArgumentCaptor.forClass(Runnable.class);
+            verify(workerPool)
+                    .scheduleAtFixedRate(
+                            scheduled.capture(),
+                            eq(60_000L),
+                            eq(60_000L),
+                            eq(TimeUnit.MILLISECONDS));
+
+            scheduled.getValue().run();
+
+            ArgumentCaptor<Path> dump = ArgumentCaptor.forClass(Path.class);
+            verify(client).upload(any(), any(), anyInt(), any(), dump.capture());
+            return dump.getValue();
+        } finally {
+            periodicHarvester.stop();
+        }
     }
 }
