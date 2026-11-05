@@ -67,6 +67,7 @@ public class Harvester implements FlightRecorderListener {
     private final int maxFiles;
     private final RecordingSettings exitSettings;
     private final long exitTimeout;
+    private final int exitBallastSize;
     private final RecordingSettings periodicSettings;
     private final boolean autoanalyze;
     private final CryostatClient client;
@@ -85,6 +86,11 @@ public class Harvester implements FlightRecorderListener {
     // safe to read, whether that write was performed by our own exit upload or by the JDK's JFR
     // shutdown hook.
     private volatile CountDownLatch exitDumpWritten = new CountDownLatch(1);
+    // Heap reserved up front and dropped on the way into the exit upload. If the host application
+    // died of an OutOfMemoryError then every allocation the exit path needs is competing for a
+    // heap that has nothing left to give. Releasing this makes room for them. Written on the
+    // harvester executor thread and cleared on the shutdown hook thread, hence volatile.
+    private volatile byte[] exitBallast;
     private final AtomicBoolean scheduledUploadInProgress = new AtomicBoolean(false);
     private FlightRecorder flightRecorder;
     private Future<?> task;
@@ -99,6 +105,7 @@ public class Harvester implements FlightRecorderListener {
             int maxFiles,
             RecordingSettings exitSettings,
             long exitTimeout,
+            int exitBallastSize,
             RecordingSettings periodicSettings,
             boolean autoanalyze,
             CryostatClient client,
@@ -111,6 +118,7 @@ public class Harvester implements FlightRecorderListener {
         this.maxFiles = maxFiles;
         this.exitSettings = exitSettings;
         this.exitTimeout = exitTimeout;
+        this.exitBallastSize = exitBallastSize;
         this.periodicSettings = periodicSettings;
         this.autoanalyze = autoanalyze;
         this.client = client;
@@ -155,6 +163,7 @@ public class Harvester implements FlightRecorderListener {
                         return;
                     }
                     log.debug("JFR Harvester starting");
+                    allocateExitBallast();
                     try {
                         FlightRecorder.addListener(this);
                         this.flightRecorder = FlightRecorder.getFlightRecorder();
@@ -330,6 +339,7 @@ public class Harvester implements FlightRecorderListener {
     }
 
     public Future<Void> exitUpload() {
+        releaseExitBallast();
         // Must be set on the calling (shutdown hook) thread rather than inside the async task:
         // otherwise the JDK's JFR shutdown hook can stop and close the sown recording during the
         // window between submission and execution, and our own listener callback would tear down
@@ -402,6 +412,28 @@ public class Harvester implements FlightRecorderListener {
                 throw new CompletionException(e);
             }
         }
+    }
+
+    private void allocateExitBallast() {
+        if (exitBallastSize <= 0 || exitBallast != null) {
+            return;
+        }
+        try {
+            exitBallast = new byte[exitBallastSize];
+            log.debug("Reserved {} byte heap ballast for exit upload", exitBallastSize);
+        } catch (OutOfMemoryError oome) {
+            // Nothing to recover from here: the application is already short of heap and the
+            // Harvester would make that worse by retrying.
+            log.warn("Could not reserve {} byte heap ballast for exit upload", exitBallastSize);
+        }
+    }
+
+    private void releaseExitBallast() {
+        if (exitBallast == null) {
+            return;
+        }
+        exitBallast = null;
+        log.debug("Released heap ballast for exit upload");
     }
 
     /**
