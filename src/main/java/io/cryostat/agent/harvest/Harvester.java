@@ -625,6 +625,13 @@ public class Harvester implements FlightRecorderListener {
      * capture the then-latest data. Any failure is logged here, since an exception escaping a task
      * submitted with {@code scheduleAtFixedRate} would otherwise silently cancel all subsequent
      * executions.
+     *
+     * <p>The in-progress guard is released when the upload future completes, and that completion is
+     * what {@code cryostat.agent.harvester.upload.timeout-ms} guarantees: it aborts the underlying
+     * request, including a request body write that has stalled against an unresponsive server,
+     * which the HTTP client's response timeout does not cover. Configuring that property as zero or
+     * less disables the abort, so a single stalled upload can block all subsequent scheduled
+     * uploads for as long as the connection hangs.
      */
     private void uploadOngoingScheduled() {
         if (!scheduledUploadInProgress.compareAndSet(false, true)) {
