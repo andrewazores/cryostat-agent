@@ -22,6 +22,8 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -30,8 +32,10 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
 /**
- * Minimal stand-in for a Cryostat server, just enough for an Agent to complete registration so that
- * the credentials it generated for its own HTTP API can be captured by a test.
+ * Minimal stand-in for a Cryostat server. It stubs out Agent registration, so that the credentials
+ * the Agent generated for its own HTTP API can be captured by a test, and accepts recording
+ * uploads. Tests needing more specific behaviour, such as failing or counting uploads, should
+ * extend this class and override the protected handler methods.
  */
 public class FakeCryostatServer implements AutoCloseable {
 
@@ -42,13 +46,16 @@ public class FakeCryostatServer implements AutoCloseable {
 
     private final ObjectMapper mapper = new ObjectMapper();
     private final HttpServer server;
+    private final ExecutorService executor = Executors.newCachedThreadPool();
     private final CompletableFuture<String[]> credentials = new CompletableFuture<>();
 
     public FakeCryostatServer() throws IOException {
         server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
+        server.setExecutor(executor);
         server.createContext("/health", ex -> respond(ex, 200, HEALTH));
         server.createContext("/api/v4.3/discovery/agents", this::register);
         server.createContext("/api/v4/discovery", ex -> respond(ex, 200, PLUGIN_INFO));
+        server.createContext("/api/beta/recordings/", this::upload);
         server.createContext("/", ex -> respond(ex, 200, "{}"));
         server.start();
     }
@@ -62,7 +69,7 @@ public class FakeCryostatServer implements AutoCloseable {
         return credentials.get(timeout, unit);
     }
 
-    private void register(HttpExchange ex) throws IOException {
+    protected void register(HttpExchange ex) throws IOException {
         try (InputStream is = ex.getRequestBody()) {
             JsonNode credential = mapper.readTree(is).get("credential");
             credentials.complete(
@@ -73,7 +80,15 @@ public class FakeCryostatServer implements AutoCloseable {
         respond(ex, 200, PLUGIN_INFO);
     }
 
-    private static void respond(HttpExchange ex, int status, String body) throws IOException {
+    /** Handles {@code POST /api/beta/recordings/<jvmId>} by consuming the body and accepting it. */
+    protected void upload(HttpExchange ex) throws IOException {
+        try (InputStream is = ex.getRequestBody()) {
+            is.readAllBytes();
+        }
+        respond(ex, 201, "{}");
+    }
+
+    protected static void respond(HttpExchange ex, int status, String body) throws IOException {
         byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
         ex.getResponseHeaders().add("Content-Type", "application/json");
         ex.sendResponseHeaders(status, bytes.length);
@@ -86,5 +101,6 @@ public class FakeCryostatServer implements AutoCloseable {
     @Override
     public void close() {
         server.stop(0);
+        executor.shutdownNow();
     }
 }
