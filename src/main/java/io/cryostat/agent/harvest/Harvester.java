@@ -86,6 +86,11 @@ public class Harvester implements FlightRecorderListener {
     // shutdown hook.
     private volatile CountDownLatch exitDumpWritten = new CountDownLatch(1);
     private final AtomicBoolean scheduledUploadInProgress = new AtomicBoolean(false);
+    // Tracks whether this instance is currently registered with the FlightRecorder, so that the
+    // registration can be restored on the exit path: the countdown of exitDumpWritten is only
+    // delivered to a registered listener, and the Harvester may have been stopped (and therefore
+    // deregistered) before the JVM began shutting down.
+    private final AtomicBoolean listenerRegistered = new AtomicBoolean(false);
     private FlightRecorder flightRecorder;
     private Future<?> task;
     private boolean running;
@@ -156,7 +161,7 @@ public class Harvester implements FlightRecorderListener {
                     }
                     log.debug("JFR Harvester starting");
                     try {
-                        FlightRecorder.addListener(this);
+                        addFlightRecorderListener();
                         this.flightRecorder = FlightRecorder.getFlightRecorder();
                         if (exitSettings.maxAge > 0) {
                             log.debug(
@@ -222,10 +227,22 @@ public class Harvester implements FlightRecorderListener {
                         this.task.cancel(true);
                         this.task = null;
                     }
-                    FlightRecorder.removeListener(this);
+                    if (listenerRegistered.compareAndSet(true, false)) {
+                        FlightRecorder.removeListener(this);
+                    }
                     log.trace("Harvester stopped");
                     running = false;
                 });
+    }
+
+    /**
+     * Registers this instance as a {@link FlightRecorderListener}, unless it is already registered.
+     * Registering twice would cause every recording state change to be handled twice.
+     */
+    private void addFlightRecorderListener() {
+        if (listenerRegistered.compareAndSet(false, true)) {
+            FlightRecorder.addListener(this);
+        }
     }
 
     @Override
@@ -335,6 +352,18 @@ public class Harvester implements FlightRecorderListener {
         // window between submission and execution, and our own listener callback would tear down
         // the data this upload is about to read.
         shuttingDown.set(true);
+        // Also restored on the calling thread, and before the deadline starts running: the only
+        // signal that the sown recording's dump-on-exit file has been written is this listener's
+        // STOPPED callback, so if the Harvester was stopped (and deregistered) earlier, the
+        // fallback below would otherwise wait out its whole budget for a countdown that can never
+        // arrive. Re-registering is a no-op while still registered.
+        if (flightRecorder != null) {
+            try {
+                addFlightRecorderListener();
+            } catch (SecurityException | IllegalStateException e) {
+                log.warn("Could not restore FlightRecorder listener for exit upload", e);
+            }
+        }
         // The deadline is taken here, on the shutdown hook thread, rather than inside the task.
         // The task is submitted to a single-threaded executor that may still be busy with a
         // periodic upload, and that queueing delay has to count against the budget too - otherwise
